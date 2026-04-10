@@ -27,9 +27,10 @@ const (
 
 // entry represents one visual block in the conversation area.
 type entry struct {
-	kind    entryKind
-	content string
-	detail  string // for tool entries: result preview
+	kind     entryKind
+	content  string
+	detail   string // for tool entries: result preview
+	markdown markdownDocument
 }
 
 type appEventKind int
@@ -48,6 +49,12 @@ type appEvent struct {
 }
 
 type styledLine struct {
+	spans     []styledSpan
+	fillStyle tcell.Style
+	fill      bool
+}
+
+type styledSpan struct {
 	text  string
 	style tcell.Style
 }
@@ -233,7 +240,11 @@ func (a *App) handleAppEvent(ev appEvent) {
 		if ev.err != nil {
 			a.entries = append(a.entries, entry{kind: entryError, content: ev.err.Error()})
 		} else if ev.content != "" {
-			a.entries = append(a.entries, entry{kind: entryAssistant, content: ev.content})
+			a.entries = append(a.entries, entry{
+				kind:     entryAssistant,
+				content:  ev.content,
+				markdown: parseMarkdownDocument(ev.content),
+			})
 		}
 		a.scrollToBottom()
 	}
@@ -303,7 +314,7 @@ func (a *App) draw(s tcell.Screen) {
 
 	for y := 0; y < bodyHeight && a.scrollTop+y < len(lines); y++ {
 		line := lines[a.scrollTop+y]
-		drawText(s, 0, y, a.width, line.text, line.style)
+		drawStyledLine(s, 0, y, a.width, line)
 	}
 
 	a.drawInputBox(s, inputY)
@@ -318,7 +329,7 @@ func (a *App) renderConversationLines(width int) []styledLine {
 
 	lines := make([]styledLine, 0, len(a.entries)*4+16)
 	for _, line := range LogoLines(width) {
-		lines = append(lines, styledLine{text: line, style: logoStyle})
+		lines = append(lines, styledLine{spans: []styledSpan{{text: line, style: logoStyle}}})
 	}
 	lines = append(lines, styledLine{}, styledLine{})
 
@@ -328,7 +339,7 @@ func (a *App) renderConversationLines(width int) []styledLine {
 			lines = appendWrapped(lines, wrapPrefixedText("❯ ", "  ", e.content, width), userStyle)
 			lines = append(lines, styledLine{}, styledLine{})
 		case entryAssistant:
-			lines = appendWrapped(lines, wrapPrefixedText("", "", e.content, width), assistantStyle)
+			lines = append(lines, renderMarkdownDocument(e.markdown, width)...)
 			lines = append(lines, styledLine{}, styledLine{})
 		case entryTool:
 			lines = appendWrapped(lines, wrapPrefixedText("  🔧 ", "    ", e.content, width), toolStyle)
@@ -343,7 +354,7 @@ func (a *App) renderConversationLines(width int) []styledLine {
 	}
 
 	if a.working {
-		lines = append(lines, styledLine{text: "  ⋯ thinking", style: dimStyle})
+		lines = append(lines, styledLine{spans: []styledSpan{{text: "  ⋯ thinking", style: dimStyle}}})
 	}
 
 	return lines
@@ -351,7 +362,11 @@ func (a *App) renderConversationLines(width int) []styledLine {
 
 func appendWrapped(lines []styledLine, wrapped []string, style tcell.Style) []styledLine {
 	for _, line := range wrapped {
-		lines = append(lines, styledLine{text: line, style: style})
+		if line == "" {
+			lines = append(lines, styledLine{})
+			continue
+		}
+		lines = append(lines, styledLine{spans: []styledSpan{{text: line, style: style}}})
 	}
 	return lines
 }
@@ -671,6 +686,23 @@ func drawStyledInputLine(s tcell.Screen, x, y, width int, text string) {
 	drawText(s, x, y, width, text, inputTextStyle)
 }
 
+func drawStyledLine(s tcell.Screen, x, y, width int, line styledLine) int {
+	if width <= 0 || y < 0 {
+		return 0
+	}
+	if line.fill {
+		fillLine(s, x, y, width, line.fillStyle)
+	}
+	used := 0
+	for _, span := range line.spans {
+		if used >= width {
+			break
+		}
+		used += drawText(s, x+used, y, width-used, span.text, span.style)
+	}
+	return used
+}
+
 func drawText(s tcell.Screen, x, y, width int, text string, style tcell.Style) int {
 	if width <= 0 || y < 0 {
 		return 0
@@ -742,6 +774,10 @@ func runeWidth(r rune) int {
 		return 1
 	}
 	return w
+}
+
+func runewidthString(s string) int {
+	return runewidth.StringWidth(s)
 }
 
 func min(a, b int) int {

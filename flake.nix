@@ -2,8 +2,8 @@
   description = "muon build environment";
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    jailed-agents = {
-      url = "github:andersonjoseph/jailed-agents";
+    llm-agents = {
+      url = "github:numtide/llm-agents.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -11,7 +11,7 @@
     {
       self,
       nixpkgs,
-      jailed-agents,
+      llm-agents,
       ...
     }:
     let
@@ -23,12 +23,7 @@
         packages = with pkgs; [
           bashInteractive
           go
-          (jailed-agents.lib.${system}.makeJailedOpencode {
-            extraPkgs = [
-              nodejs
-              go
-            ];
-          })
+          llm-agents.packages.${system}.opencode
         ];
       };
     };

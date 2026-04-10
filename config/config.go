@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -26,29 +28,34 @@ type Config struct {
 }
 
 func Load(configPath, providersPath string) (*Config, error) {
-	providers, err := loadProviders(providersPath)
-	if err != nil {
-		return nil, err
-	}
-
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := strictUnmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
 	providerName, modelName, ok := strings.Cut(cfg.Model, "/")
-	if !ok {
+	if !ok || providerName == "" || modelName == "" {
 		return nil, fmt.Errorf("model must be in <provider>/<model> format, got %q", cfg.Model)
+	}
+
+	providers, err := loadProviders(providersPath)
+	if err != nil {
+		return nil, err
 	}
 
 	provider, ok := providers[providerName]
 	if !ok {
 		return nil, fmt.Errorf("provider %q not found in %s", providerName, providersPath)
+	}
+
+	provider, err = resolveProvider(providerName, provider)
+	if err != nil {
+		return nil, err
 	}
 
 	cfg.BaseURL = provider.URL
@@ -63,6 +70,10 @@ func Load(configPath, providersPath string) (*Config, error) {
 		cfg.MaxTurns = 50
 	}
 
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
 }
 
@@ -73,28 +84,63 @@ func loadProviders(path string) (map[string]Provider, error) {
 	}
 
 	var list []Provider
-	if err := yaml.Unmarshal(data, &list); err != nil {
+	if err := strictUnmarshal(data, &list); err != nil {
 		return nil, fmt.Errorf("parse providers: %w", err)
 	}
 
 	m := make(map[string]Provider, len(list))
 	for _, p := range list {
+		if p.Name == "" {
+			return nil, fmt.Errorf("provider name is required")
+		}
+		if _, exists := m[p.Name]; exists {
+			return nil, fmt.Errorf("duplicate provider name %q", p.Name)
+		}
 		m[p.Name] = p
 	}
 
-	for name, p := range m {
-		p.URL, err = expandEnv(p.URL)
-		if err != nil {
-			return nil, fmt.Errorf("provider %q url: %w", name, err)
-		}
-		p.Key, err = expandEnv(p.Key)
-		if err != nil {
-			return nil, fmt.Errorf("provider %q key: %w", name, err)
-		}
-		m[name] = p
+	return m, nil
+}
+
+func resolveProvider(name string, p Provider) (Provider, error) {
+	var err error
+	p.URL, err = expandEnv(p.URL)
+	if err != nil {
+		return Provider{}, fmt.Errorf("provider %q url: %w", name, err)
+	}
+	p.Key, err = expandEnv(p.Key)
+	if err != nil {
+		return Provider{}, fmt.Errorf("provider %q key: %w", name, err)
+	}
+	if _, err := url.ParseRequestURI(p.URL); err != nil {
+		return Provider{}, fmt.Errorf("provider %q url: %w", name, err)
 	}
 
-	return m, nil
+	return p, nil
+}
+
+func strictUnmarshal(data []byte, v any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data), yaml.DisallowUnknownField())
+	return dec.Decode(v)
+}
+
+func validateConfig(cfg Config) error {
+	if cfg.Model == "" {
+		return fmt.Errorf("config model is required")
+	}
+	if cfg.BaseURL == "" {
+		return fmt.Errorf("config base URL is required")
+	}
+	if cfg.MaxTokens < 0 {
+		return fmt.Errorf("config max_tokens must be non-negative")
+	}
+	if cfg.MaxTurns <= 0 {
+		return fmt.Errorf("config max_turns must be greater than zero")
+	}
+	if cfg.MaxContextTokens < 0 {
+		return fmt.Errorf("config max_context_tokens must be non-negative")
+	}
+	return nil
 }
 
 // expandEnv replaces ${VAR} patterns in s with the corresponding

@@ -21,14 +21,14 @@ Two YAML files control behavior:
 
 ```yaml
 model: zai/glm-5.1 # <provider>/<model> format
-max_tokens: 4096 # max response tokens per turn
+max_tokens: 8192 # max response tokens per turn
 max_turns: 50 # agent loop iteration limit
 # max_context_tokens: 128000   # override auto-detected context window (fetched from provider API)
 system_prompt: |
   You are muon, a coding assistant.
 ```
 
-The model field uses `provider/model` syntax. The provider name is looked up in `providers.yml` to resolve the base URL and API key.
+The model provider name is looked up in `providers.yml` to resolve the base URL and API key.
 
 **`providers.yml`** — API endpoints and credentials (gitignored):
 
@@ -38,7 +38,7 @@ The model field uses `provider/model` syntax. The provider name is looked up in 
   key: "${ZAI_API_KEY}"
 ```
 
-API keys use `${ENV_VAR}` syntax — the value is read from the environment at startup. An error is raised if the variable is not set.
+API keys use `${ENV_VAR}` syntax — the value is read from the environment at startup.
 
 ## Usage
 
@@ -200,7 +200,8 @@ type Tool interface {
 
 Register tools with a `tool.Registry`. The registry produces OpenAI function-calling definitions in registration order (deterministic). Schema helpers (`ObjectSchema`, `StringParam`, `IntParam`) build parameter definitions.
 
-Built-in tools (currently stubs):
+Built-in tool types exist in `tool/`, but they are currently stubs and are not
+registered by default:
 
 | Tool    | Description                        |
 | ------- | ---------------------------------- |

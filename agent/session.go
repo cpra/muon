@@ -55,7 +55,10 @@ func (s *Session) runLoop(ctx context.Context) (string, error) {
 		s.usage.CompletionTokens += usage.CompletionTokens
 		s.usage.TotalTokens += usage.TotalTokens
 
-		turnCost := s.agent.client.CalculateCost(usage)
+		turnCost, err := s.agent.client.CalculateCost(usage)
+		if err != nil {
+			return "", fmt.Errorf("turn %d: calculate cost: %w", i+1, err)
+		}
 		s.cost.PromptCost += turnCost.PromptCost
 		s.cost.CompletionCost += turnCost.CompletionCost
 		s.cost.TotalCost += turnCost.TotalCost

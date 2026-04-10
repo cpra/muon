@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -34,6 +37,7 @@ type Client struct {
 	mu           sync.Mutex
 	modelInfo    *Model
 	modelFetched bool
+	fetchWait    chan struct{}
 }
 
 func NewClient(cfg Config) *Client {
@@ -112,6 +116,12 @@ func (c *Client) doRequest(ctx context.Context, method, path string, payload int
 
 		resp, err := c.http.Do(req)
 		if err != nil {
+			if attempt < maxRetries && isRetryableError(err) {
+				if err := sleepWithBackoff(ctx, attempt, 0); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			return nil, fmt.Errorf("send request: %w", err)
 		}
 
@@ -121,14 +131,15 @@ func (c *Client) doRequest(ctx context.Context, method, path string, payload int
 			return nil, fmt.Errorf("read response: %w", err)
 		}
 
-		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries {
-			delay := retryBaseDelay * time.Duration(math.Pow(2, float64(attempt)))
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-				continue
+		if attempt < maxRetries && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
+			retryAfter := time.Duration(0)
+			if resp.StatusCode == http.StatusTooManyRequests {
+				retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
 			}
+			if err := sleepWithBackoff(ctx, attempt, retryAfter); err != nil {
+				return nil, err
+			}
+			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -141,6 +152,42 @@ func (c *Client) doRequest(ctx context.Context, method, path string, payload int
 
 		return respBody, nil
 	}
+}
+
+func sleepWithBackoff(ctx context.Context, attempt int, retryAfter time.Duration) error {
+	delay := retryBaseDelay * time.Duration(math.Pow(2, float64(attempt)))
+	if retryAfter > delay {
+		delay = retryAfter
+	}
+	j := time.Duration(rand.Int63n(int64(delay/2 + 1)))
+	delay += j
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(delay):
+		return nil
+	}
+}
+
+func parseRetryAfter(v string) time.Duration {
+	if s, err := strconv.Atoi(v); err == nil {
+		return time.Duration(s) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return time.Until(t)
+	}
+	return 0
+}
+
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && (ne.Timeout() || ne.Temporary()) {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func (c *Client) Create(ctx context.Context, msgs []message.Message, tools []map[string]interface{}) (*message.Message, Usage, error) {
@@ -201,27 +248,46 @@ func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 // The fetch is best-effort: errors are returned but not cached so the caller
 // can retry.
 func (c *Client) EnsureModelInfo(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	for {
+		c.mu.Lock()
+		if c.modelFetched {
+			c.mu.Unlock()
+			return nil
+		}
+		if waitCh := c.fetchWait; waitCh != nil {
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-waitCh:
+				continue
+			}
+		}
 
-	if c.modelFetched {
-		return nil
-	}
+		waitCh := make(chan struct{})
+		c.fetchWait = waitCh
+		c.mu.Unlock()
 
-	models, err := c.ListModels(ctx)
-	if err != nil {
+		models, err := c.ListModels(ctx)
+
+		c.mu.Lock()
+		if err == nil {
+			c.modelFetched = true
+			c.modelInfo = nil
+			for i := range models {
+				if models[i].ID == c.cfg.Model {
+					info := models[i]
+					c.modelInfo = &info
+					break
+				}
+			}
+		}
+		c.fetchWait = nil
+		close(waitCh)
+		c.mu.Unlock()
+
 		return err
 	}
-
-	c.modelFetched = true
-	for i := range models {
-		if models[i].ID == c.cfg.Model {
-			info := models[i]
-			c.modelInfo = &info
-			break
-		}
-	}
-	return nil
 }
 
 const defaultContextLength = 128000
@@ -250,17 +316,23 @@ func (c *Client) ContextLength() int {
 // CalculateCost returns the monetary cost for a given usage block based on
 // the cached model pricing. Returns a zero-value CostInfo if pricing data is
 // unavailable.
-func (c *Client) CalculateCost(usage Usage) CostInfo {
+func (c *Client) CalculateCost(usage Usage) (CostInfo, error) {
 	c.mu.Lock()
 	info := c.modelInfo
 	c.mu.Unlock()
 
 	if info == nil {
-		return CostInfo{}
+		return CostInfo{}, nil
 	}
 
-	promptPrice, _ := strconv.ParseFloat(info.Pricing.Prompt, 64)
-	completionPrice, _ := strconv.ParseFloat(info.Pricing.Completion, 64)
+	promptPrice, err := parsePrice(info.Pricing.Prompt)
+	if err != nil {
+		return CostInfo{}, err
+	}
+	completionPrice, err := parsePrice(info.Pricing.Completion)
+	if err != nil {
+		return CostInfo{}, err
+	}
 
 	promptCost := float64(usage.PromptTokens) * promptPrice
 	completionCost := float64(usage.CompletionTokens) * completionPrice
@@ -269,5 +341,16 @@ func (c *Client) CalculateCost(usage Usage) CostInfo {
 		PromptCost:     promptCost,
 		CompletionCost: completionCost,
 		TotalCost:      promptCost + completionCost,
+	}, nil
+}
+
+func parsePrice(s string) (float64, error) {
+	if s == "" {
+		return 0, nil
 	}
+	p, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid pricing %q: %w", s, err)
+	}
+	return p, nil
 }

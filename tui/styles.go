@@ -85,4 +85,8 @@ var (
 
 	dimStyle = tcell.StyleDefault.
 			Foreground(color.PaletteColor(8))
+
+	spinnerStyle = tcell.StyleDefault.
+			Foreground(color.PaletteColor(6)).
+			Bold(true)
 )

@@ -35,6 +35,10 @@ func main() {
 
 	args := flag.Args()
 	ctx := context.Background()
+	workingDir, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("get working directory: %v", err)
+	}
 
 	if len(args) > 0 && args[0] == "list-models" {
 		models, err := client.ListModels(ctx)
@@ -51,6 +55,7 @@ func main() {
 		prompt := strings.Join(args, " ")
 
 		registry := tool.NewRegistry()
+		registry.Register(&tool.ReadTool{WorkingDir: workingDir})
 
 		a := agent.New(client, registry, cfg.MaxTurns, cfg.SystemPrompt)
 		reply, err := a.Run(ctx, prompt)
@@ -62,7 +67,7 @@ func main() {
 	}
 
 	registry := tool.NewRegistry()
-	workingDir, _ := os.Getwd()
+	registry.Register(&tool.ReadTool{WorkingDir: workingDir})
 	app := tui.New(client, cfg, workingDir)
 	a := agent.New(client, registry, cfg.MaxTurns, cfg.SystemPrompt,
 		agent.WithHook(app.Hook),

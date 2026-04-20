@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gdamore/tcell/v3"
 	"github.com/mattn/go-runewidth"
@@ -14,6 +15,8 @@ import (
 	"github.com/cpra/muon/config"
 	"github.com/cpra/muon/llm"
 )
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // entryKind distinguishes conversation entry types for styling.
 type entryKind int
@@ -70,8 +73,11 @@ type App struct {
 	session *agent.Session
 	working bool
 
+	spinnerFrame int
+
 	cost       llm.CostInfo
 	usage      llm.Usage
+	turnUsage  llm.Usage
 	contextLen int
 
 	width     int
@@ -145,7 +151,7 @@ func (a *App) Run() error {
 		a.width, a.height = s.Size()
 		a.draw(s)
 
-		ev := <-s.EventQ()
+		ev := a.waitForEvent(s)
 		switch ev := ev.(type) {
 		case *tcell.EventResize:
 			s.Sync()
@@ -163,6 +169,19 @@ func (a *App) Run() error {
 // started yet.
 func (a *App) Session() *agent.Session {
 	return a.session
+}
+
+func (a *App) waitForEvent(s tcell.Screen) tcell.Event {
+	if a.working {
+		select {
+		case ev := <-s.EventQ():
+			return ev
+		case <-time.After(80 * time.Millisecond):
+			a.spinnerFrame = (a.spinnerFrame + 1) % len(spinnerFrames)
+			return tcell.NewEventInterrupt(nil)
+		}
+	}
+	return <-s.EventQ()
 }
 
 // --- layout helpers ---
@@ -194,6 +213,8 @@ func (a *App) submitPrompt() {
 	a.cursor = 0
 	a.entries = append(a.entries, entry{kind: entryUser, content: prompt})
 	a.working = true
+	a.spinnerFrame = 0
+	a.turnUsage = llm.Usage{}
 	a.scrollToBottom()
 	go a.runAgent(prompt)
 }
@@ -277,9 +298,12 @@ func (a *App) processEvent(e agent.Event) {
 			v := ev.Args[k]
 			argsParts = append(argsParts, fmt.Sprintf("%s=%v", k, v))
 		}
-		resultPreview := ev.Result.Content
-		if len(resultPreview) > 200 {
-			resultPreview = resultPreview[:200] + "…"
+		resultPreview := ""
+		if ev.Name != "read" {
+			resultPreview = ev.Result.Content
+			if len(resultPreview) > 200 {
+				resultPreview = resultPreview[:200] + "…"
+			}
 		}
 		a.entries = append(a.entries, entry{
 			kind:    entryTool,
@@ -289,6 +313,8 @@ func (a *App) processEvent(e agent.Event) {
 	case agent.TurnEndEvent:
 		a.usage = ev.AccumulatedUsage
 		a.cost = ev.AccumulatedCost
+	case agent.LLMResponseEvent:
+		a.turnUsage = ev.Usage
 	}
 }
 
@@ -354,7 +380,15 @@ func (a *App) renderConversationLines(width int) []styledLine {
 	}
 
 	if a.working {
-		lines = append(lines, styledLine{spans: []styledSpan{{text: "  ⋯ thinking", style: dimStyle}}})
+		frame := spinnerFrames[a.spinnerFrame%len(spinnerFrames)]
+		var spans []styledSpan
+		spans = append(spans, styledSpan{text: "  " + frame + " ", style: spinnerStyle})
+		spans = append(spans, styledSpan{text: "thinking", style: dimStyle})
+		if a.turnUsage.PromptTokens > 0 || a.turnUsage.CompletionTokens > 0 {
+			tokenText := fmt.Sprintf(" · ↑%s ↓%s", formatTokens(a.turnUsage.PromptTokens), formatTokens(a.turnUsage.CompletionTokens))
+			spans = append(spans, styledSpan{text: tokenText, style: dimStyle})
+		}
+		lines = append(lines, styledLine{spans: spans})
 	}
 
 	return lines
